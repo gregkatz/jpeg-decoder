@@ -29,8 +29,6 @@
 #![deny(missing_docs)]
 
 extern crate byteorder;
-#[cfg(feature="rayon")]
-extern crate rayon;
 
 pub use decoder::{Decoder, ImageInfo, PixelFormat};
 pub use error::{Error, UnsupportedFeature};
@@ -42,4 +40,4 @@ mod idct;
 mod marker;
 mod parser;
 mod upsampler;
-mod worker_thread;
+mod sync_worker;

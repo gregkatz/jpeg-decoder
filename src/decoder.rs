@@ -9,9 +9,8 @@ use std::cmp;
 use std::io::Read;
 use std::mem;
 use std::ops::Range;
-use std::sync::Arc;
-use std::sync::mpsc::{self, Sender};
-use worker_thread::{RowData, spawn_worker_thread, WorkerMsg};
+use std::rc::Rc;
+use sync_worker::{RowData, WorkerMsg, WorkerContext};
 
 pub const MAX_COMPONENTS: usize = 4;
 
@@ -55,7 +54,7 @@ pub struct Decoder<R> {
     frame: Option<FrameInfo>,
     dc_huffman_tables: Vec<Option<HuffmanTable>>,
     ac_huffman_tables: Vec<Option<HuffmanTable>>,
-    quantization_tables: [Option<Arc<[u16; 64]>>; 4],
+    quantization_tables: [Option<Rc<[u16; 64]>>; 4],
 
     restart_interval: u16,
     color_transform: Option<AdobeColorTransform>,
@@ -133,7 +132,7 @@ impl<R: Read> Decoder<R> {
 
         let mut previous_marker = Marker::SOI;
         let mut pending_marker = None;
-        let mut worker_chan = None;
+        let mut worker_context = None;
         let mut scans_processed = 0;
         let mut planes = vec![Vec::new(); self.frame.as_ref().map_or(0, |frame| frame.components.len())];
 
@@ -193,8 +192,8 @@ impl<R: Read> Decoder<R> {
                     if self.frame.is_none() {
                         return Err(Error::Format("scan encountered before frame".to_owned()));
                     }
-                    if worker_chan.is_none() {
-                        worker_chan = Some(spawn_worker_thread()?);
+                    if worker_context.is_none() {
+                        worker_context = Some(WorkerContext::new());
                     }
 
                     let frame = self.frame.clone().unwrap();
@@ -216,7 +215,7 @@ impl<R: Read> Decoder<R> {
                     }
 
                     let is_final_scan = scan.component_indices.iter().all(|&i| self.coefficients_finished[i] == !0);
-                    let (marker, data) = self.decode_scan(&frame, &scan, worker_chan.as_ref().unwrap(), is_final_scan)?;
+                    let (marker, data) = self.decode_scan(&frame, &scan, worker_context.as_mut().unwrap(), is_final_scan)?;
 
                     if let Some(data) = data {
                         for (i, plane) in data.into_iter().enumerate().filter(|&(_, ref plane)| !plane.is_empty()) {
@@ -241,7 +240,7 @@ impl<R: Read> Decoder<R> {
                                 unzigzagged_table[UNZIGZAG[j] as usize] = table[j];
                             }
 
-                            self.quantization_tables[i] = Some(Arc::new(unzigzagged_table));
+                            self.quantization_tables[i] = Some(Rc::new(unzigzagged_table));
                         }
                     }
                 },
@@ -357,7 +356,7 @@ impl<R: Read> Decoder<R> {
     fn decode_scan(&mut self,
                    frame: &FrameInfo,
                    scan: &ScanInfo,
-                   worker_chan: &Sender<WorkerMsg>,
+                   worker_context: &mut WorkerContext,
                    produce_data: bool)
                    -> Result<(Option<Marker>, Option<Vec<Vec<u8>>>)> {
         assert!(scan.component_indices.len() <= MAX_COMPONENTS);
@@ -394,7 +393,7 @@ impl<R: Read> Decoder<R> {
                     quantization_table: self.quantization_tables[component.quantization_table_index].clone().unwrap(),
                 };
 
-                worker_chan.send(WorkerMsg::Start(row_data))?;
+                worker_context.process_message(WorkerMsg::Start(row_data));
             }
         }
 
@@ -516,7 +515,7 @@ impl<R: Read> Decoder<R> {
                         mem::replace(&mut mcu_row_coefficients[i], vec![0i16; coefficients_per_mcu_row])
                     };
 
-                    worker_chan.send(WorkerMsg::AppendRow((i, row_coefficients)))?;
+                    worker_context.process_message(WorkerMsg::AppendRow((i, row_coefficients)));
                 }
             }
         }
@@ -528,10 +527,10 @@ impl<R: Read> Decoder<R> {
             let mut data = vec![Vec::new(); frame.components.len()];
 
             for (i, &component_index) in scan.component_indices.iter().enumerate() {
-                let (tx, rx) = mpsc::channel();
-                worker_chan.send(WorkerMsg::GetResult((i, tx)))?;
+                let mut result = Vec::new();
+                worker_context.process_message(WorkerMsg::GetResult((i, &mut result)));
 
-                data[component_index] = rx.recv()?;
+                data[component_index] = result;
             }
 
             Ok((marker, Some(data)))
@@ -782,31 +781,6 @@ fn compute_image(components: &[Component],
     }
 }
 
-#[cfg(feature="rayon")]
-fn compute_image_parallel(components: &[Component],
-                 data: &[Vec<u8>],
-                 output_size: Dimensions,
-                 is_jfif: bool,
-                 color_transform: Option<AdobeColorTransform>) -> Result<Vec<u8>> {
-    use rayon::prelude::*;
-
-    let color_convert_func = choose_color_convert_func(components.len(), is_jfif, color_transform)?;
-    let upsampler = Upsampler::new(components, output_size.width, output_size.height)?;
-    let line_size = output_size.width as usize * components.len();
-    let mut image = vec![0u8; line_size * output_size.height as usize];
-
-    image.par_chunks_mut(line_size)
-         .with_max_len(1)
-         .enumerate()
-         .for_each(|(row, line)| {
-             upsampler.upsample_and_interleave_row(data, row, output_size.width as usize, line);
-             color_convert_func(line, output_size.width as usize);
-         });
-
-    Ok(image)
- }
-
-#[cfg(not(feature="rayon"))]
 fn compute_image_parallel(components: &[Component],
                  data: &[Vec<u8>],
                  output_size: Dimensions,
